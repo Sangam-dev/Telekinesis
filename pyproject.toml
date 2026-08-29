@@ -1,0 +1,13 @@
+[project]
+name = "sixth-sense"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "joblib>=1.5.3",
+    "mediapipe>=1.0.1",
+    "opencv-python>=5.0.0.93",
+    "psutil>=7.2.2",
+    "pyautogui>=0.9.54",
+]
