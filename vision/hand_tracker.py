@@ -1,17 +1,22 @@
+import time
+
 import cv2
 import mediapipe as mp
 import numpy as np
-import time
 
 
 class HandTracker:
-    def __init__(self, max_hands=2, detection_conf=0.5, tracking_conf=0.5):
+    def __init__(self, max_hands=2, detection_conf=0.6, tracking_conf=0.6):
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=max_hands,
             min_detection_confidence=detection_conf,
             min_tracking_confidence=tracking_conf,
+            # model_complexity=0 uses the lightweight (fast) hand model.
+            # complexity=1 is more accurate but ~2x slower on CPU.
+            # For real-time cursor control at 30+ fps, 0 is the right choice.
+            model_complexity=0,
         )
         self.mp_draw = mp.solutions.drawing_utils
 
@@ -65,8 +70,15 @@ if __name__ == "__main__":
         now = time.time()
         fps = 1.0 / max(now - prev_time, 1e-6)
         prev_time = now
-        cv2.putText(frame, f"FPS: {fps:.1f}  Hands: {len(hands_lms)}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(
+            frame,
+            f"FPS: {fps:.1f}  Hands: {len(hands_lms)}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+        )
 
         cv2.imshow("Hand Tracker Sanity Check (press ESC to quit)", frame)
         if cv2.waitKey(1) & 0xFF == 27:  # ESC
