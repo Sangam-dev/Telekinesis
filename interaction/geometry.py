@@ -11,7 +11,7 @@ WRIST_IDX = 0
 # ── One-Euro Filter (1D) ─────────────────────────────────────────────────────
 
 
-class _OneEuro:
+class OneEuroFilter:
     """
     One-Euro Filter for a single scalar signal.
     Reference: Casiez et al. CHI 2012.
@@ -75,15 +75,15 @@ class CursorMapper:
         screen_w: int,
         screen_h: int,
         active_zone: tuple[float, float, float, float] = (0.10, 0.90, 0.05, 0.95),
-        min_cutoff: float = 0.8,
-        beta: float = 0.4,
+        min_cutoff: float = 0.5,
+        beta: float = 1.5,
     ):
         self.screen_w = screen_w
         self.screen_h = screen_h
         # active_zone = (x_lo, x_hi, y_lo, y_hi) in normalized camera coords
         self.az_x0, self.az_x1, self.az_y0, self.az_y1 = active_zone
-        self._fx = _OneEuro(min_cutoff=min_cutoff, beta=beta)
-        self._fy = _OneEuro(min_cutoff=min_cutoff, beta=beta)
+        self._fx = OneEuroFilter(min_cutoff=min_cutoff, beta=beta)
+        self._fy = OneEuroFilter(min_cutoff=min_cutoff, beta=beta)
 
     def update(
         self, landmarks_xyz: np.ndarray, xy_norm: tuple[float, float] | None = None
@@ -100,12 +100,15 @@ class CursorMapper:
         norm_x = max(0.0, min(1.0, norm_x))
         norm_y = max(0.0, min(1.0, norm_y))
 
-        # One-Euro filter (smooth but responsive)
+        # One-Euro filter in normalised [0,1] space.
+        # Filtering before scaling keeps beta's units in (normalised/s),
+        # which is resolution-independent and prevents tremor velocity in
+        # pixel-space from opening the filter wide.
         now = time.monotonic()
-        sx = self._fx(norm_x * self.screen_w, t=now)
-        sy = self._fy(norm_y * self.screen_h, t=now)
+        fx = self._fx(norm_x, t=now) * self.screen_w
+        fy = self._fy(norm_y, t=now) * self.screen_h
 
-        return int(sx), int(sy)
+        return int(fx), int(fy)
 
     def reset(self):
         """Call when the cursor control gesture is re-entered after a pause."""

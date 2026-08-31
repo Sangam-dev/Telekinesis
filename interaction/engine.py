@@ -1,10 +1,12 @@
 import math
+import time
 
 import numpy as np
 
 import control.os_control as osc
 from interaction.geometry import (
     CursorMapper,
+    OneEuroFilter,
     ScrollPositionTracker,
     SwipeTracker,
     ZoomTracker,
@@ -14,6 +16,7 @@ from interaction.state_machine import GestureStateMachine
 # ── Tunables ──────────────────────────────────────────────────────────────────
 DRAG_THRESHOLD_PX = 18  # pixels before pinch becomes a drag
 FIST_DRAG_SCALE = 1.2  # wrist-movement amplification for window drag
+CURSOR_DEAD_ZONE_PX = 4  # ignore moves smaller than this to suppress micro-jitter
 
 # Landmark indices
 THUMB_TIP = 4
@@ -56,6 +59,14 @@ class InteractionEngine:
         self._fist_window_id: int | None = None
         self._fist_win_pos: list[int] = [0, 0]  # current window x,y
         self._fist_prev_wrist: np.ndarray | None = None  # wrist position last frame
+
+        # Smoothing filters for fist-drag wrist position (normalised coords)
+        self._fist_wrist_fx = OneEuroFilter(min_cutoff=1.0, beta=2.0)
+        self._fist_wrist_fy = OneEuroFilter(min_cutoff=1.0, beta=2.0)
+
+        # Dead-zone: last pixel position actually sent to the OS
+        self._last_cursor_px: int | None = None
+        self._last_cursor_py: int | None = None
 
         # Grace-period: last successfully tracked hand landmarks
         self._last_primary: np.ndarray | None = None
@@ -123,6 +134,8 @@ class InteractionEngine:
         """
         Moves cursor only during POINT (fingertip) or active PINCH (midpoint).
         Frozen for all other gestures → no hot-corner triggers.
+        A dead-zone suppresses micro-jitter by ignoring moves smaller than
+        CURSOR_DEAD_ZONE_PX pixels.
         """
         is_pointing = gesture_label == "point"
         is_pinching = gesture_label == "pinch"
@@ -130,13 +143,15 @@ class InteractionEngine:
         if is_pointing:
             if not self._was_pointing:
                 self.cursor_mapper.reset()
+                self._last_cursor_px = None
+                self._last_cursor_py = None
             x, y = self.cursor_mapper.update(primary)
-            osc.move_cursor_absolute(x, y)
+            self._move_cursor_deadzoned(x, y)
 
         elif is_pinching and self._pinch_live:
             mp = _pinch_midpoint(primary)
             x, y = self.cursor_mapper.update(primary, xy_norm=mp)
-            osc.move_cursor_absolute(x, y)
+            self._move_cursor_deadzoned(x, y)
 
             if not self._dragging:
                 dx, dy = x - self._drag_start[0], y - self._drag_start[1]
@@ -145,6 +160,17 @@ class InteractionEngine:
                     osc.mouse_down()
 
         self._was_pointing = is_pointing
+
+    def _move_cursor_deadzoned(self, x: int, y: int) -> None:
+        """Only forward a cursor move when it exceeds the dead-zone threshold."""
+        lx, ly = self._last_cursor_px, self._last_cursor_py
+        if lx is None or ly is None:
+            osc.move_cursor_absolute(x, y)
+            self._last_cursor_px, self._last_cursor_py = x, y
+            return
+        if math.hypot(x - lx, y - ly) >= CURSOR_DEAD_ZONE_PX:
+            osc.move_cursor_absolute(x, y)
+            self._last_cursor_px, self._last_cursor_py = x, y
 
     # ── pinch → click / drag ─────────────────────────────────────────────────
 
@@ -201,15 +227,27 @@ class InteractionEngine:
         edge) and returns, the previous frame's wrist IS the correct reference.
         No jump, no lost position — exactly one frame of zero delta (the frame
         the hand reappears), then drag resumes smoothly.
+
+        The wrist position is One-Euro filtered before computing the delta so
+        that small hand tremor does not jitter the dragged window.
         """
         self.fist_sm.update(gesture_label == "fist", confidence)
 
         if self.fist_sm.just_activated():
+            # Reset wrist smoothing so the very first filtered sample == raw sample
+            # (no history to pull from — avoids a phantom jump on activation).
+            self._fist_wrist_fx._x_prev = None
+            self._fist_wrist_fy._x_prev = None
+
             wid, wx, wy = osc.get_window_under_cursor()
             if wid is not None:
                 self._fist_window_id = wid
                 self._fist_win_pos = [wx, wy]
-                self._fist_prev_wrist = primary[WRIST, :2].copy()
+                raw = primary[WRIST, :2]
+                now = time.monotonic()
+                sx = self._fist_wrist_fx(float(raw[0]), t=now)
+                sy = self._fist_wrist_fy(float(raw[1]), t=now)
+                self._fist_prev_wrist = np.array([sx, sy], dtype=np.float64)
                 print(f"  [fist] grabbed window {wid} at ({wx},{wy})")
             else:
                 self._fist_window_id = None
@@ -219,10 +257,14 @@ class InteractionEngine:
                 )
 
         if self.fist_sm.is_held() and self._fist_window_id is not None:
-            wrist_now = primary[WRIST, :2]
+            raw = primary[WRIST, :2]
+            now = time.monotonic()
+            sx = self._fist_wrist_fx(float(raw[0]), t=now)
+            sy = self._fist_wrist_fy(float(raw[1]), t=now)
+            wrist_now = np.array([sx, sy], dtype=np.float64)
 
             if self._fist_prev_wrist is not None:
-                # Per-frame delta → accumulate into window position
+                # Per-frame delta on smoothed wrist → accumulate into window position
                 dx_norm = float(wrist_now[0] - self._fist_prev_wrist[0])
                 dy_norm = float(wrist_now[1] - self._fist_prev_wrist[1])
                 self._fist_win_pos[0] += int(
@@ -239,7 +281,7 @@ class InteractionEngine:
 
             # Always update prev_wrist — during grace period this stays frozen,
             # so delta = 0 (window holds) until the hand reappears.
-            self._fist_prev_wrist = wrist_now.copy()
+            self._fist_prev_wrist = wrist_now
 
         if self.fist_sm.just_released():
             self._fist_window_id = None

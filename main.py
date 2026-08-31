@@ -1,23 +1,3 @@
-"""
-main.py — AI Telekinesis pipeline
-
-Architecture
-────────────
-Camera thread  Reads V4L2 as fast as the sensor delivers frames and always
-               keeps the *latest* one in a shared slot.  The inference loop
-               never blocks on cap.read(); it just grabs whatever the camera
-               last delivered.
-
-Inference loop Grabs the latest frame, runs MediaPipe + MLP, calls the
-               interaction engine (cursor / click / drag / scroll / fist).
-
-Display        Shown from the inference loop on every Nth frame so the
-               OpenCV window does not become a render bottleneck.
-
-This separates capture latency from processing latency so neither can
-stall the other.
-"""
-
 import subprocess
 import threading
 import time
@@ -29,13 +9,6 @@ import torch.nn.functional as F
 
 import control.os_control as osc
 from features.extractor import extract_feature
-import numpy as np
-import torch
-import torch.nn.functional as F
-
-import control.os_control as osc
-from features.extractor import extract_feature
-from interaction.engine import InteractionEngine
 from interaction.engine import InteractionEngine
 from ml.model import GESTURE_CLASSES, load_model
 from vision.hand_tracker import HandTracker
@@ -51,7 +24,7 @@ class _ProbSmoother:
     def __init__(
         self,
         num_classes: int,
-        alpha_rise: float = 0.55,
+        alpha_rise: float = 0.35,
         alpha_fall: float = 0.15,
     ):
         self._alpha_rise = alpha_rise

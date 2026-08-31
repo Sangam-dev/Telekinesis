@@ -4,9 +4,6 @@ Real-time hand-gesture control of a real (Linux/Wayland) computer, using
 a custom-trained MLP for static gesture classification and deterministic
 geometry for motion-based interactions (cursor, zoom, swipe, scroll).
 
-See `AI_Telekinesis_2_Day_Full_Plan.md` for the full build plan, architecture
-rationale, and hour-by-hour schedule.
-
 ## Setup
 
 ```bash

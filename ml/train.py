@@ -44,7 +44,7 @@ def train_mlp(splits):
             running_loss += loss.item() * X_batch.size(0)
         train_loss = running_loss / len(train_ds)
 
-        model.eval()
+        model.eval()         
         val_loss = 0.0
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
