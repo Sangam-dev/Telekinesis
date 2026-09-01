@@ -4,6 +4,7 @@ import time
 import numpy as np
 
 import control.os_control as osc
+from config.cursor_calibration import ACTIVE_ZONE, CURSOR_OFFSET_X, CURSOR_OFFSET_Y
 from interaction.geometry import (
     CursorMapper,
     OneEuroFilter,
@@ -34,7 +35,8 @@ class InteractionEngine:
         self.screen_w = screen_w
         self.screen_h = screen_h
 
-        self.cursor_mapper = CursorMapper(screen_w, screen_h)
+        # Use calibration config for active zone
+        self.cursor_mapper = CursorMapper(screen_w, screen_h, active_zone=ACTIVE_ZONE)
         self.zoom_tracker = ZoomTracker()
         self.swipe_tracker = SwipeTracker()
         self.scroll_tracker = ScrollPositionTracker()
@@ -68,6 +70,11 @@ class InteractionEngine:
         self._last_cursor_px: int | None = None
         self._last_cursor_py: int | None = None
 
+        # Current calculated cursor position (from hand landmarks, with or without dead-zone)
+        # This is the source-of-truth for overlay positioning — eliminates OS cursor latency.
+        self._current_cursor_x: int = screen_w // 2
+        self._current_cursor_y: int = screen_h // 2
+
         # Grace-period: last successfully tracked hand landmarks
         self._last_primary: np.ndarray | None = None
 
@@ -88,6 +95,20 @@ class InteractionEngine:
         self._dragging = False
         self._fist_window_id = None
         self.control_enabled = False
+
+    def get_cursor_position(self) -> tuple[int, int]:
+        """Return the position the orb should be drawn at.
+
+        Returns the REAL, polled OS pointer position (osc.get_cursor_position())
+        rather than our internally-computed target. Now that the evdev backend
+        moves the OS cursor with absolute positioning (see os_control.py), the
+        target and the real pointer should always agree — but reading the
+        polled ground-truth here still means the orb self-corrects for free
+        if it's ever pushed by something outside our control (backend
+        fallback to ydotool, another app moving the mouse, etc.), at the
+        cost of at most one poll interval (~30ms) of latency.
+        """
+        return osc.get_cursor_position()
 
     def resume(self):
         self.control_enabled = True
@@ -132,14 +153,19 @@ class InteractionEngine:
 
     def _handle_cursor(self, gesture_label: str, primary: np.ndarray) -> None:
         """
-        Moves cursor only during POINT (fingertip) or active PINCH (midpoint).
-        Frozen for all other gestures → no hot-corner triggers.
-        A dead-zone suppresses micro-jitter by ignoring moves smaller than
-        CURSOR_DEAD_ZONE_PX pixels.
+        Always calculate and update cursor position based on current gesture.
+        The orb position is continuously synced to the calculated position.
+        
+        For OS cursor movement (click/drag), we apply dead-zone only during
+        POINT and active PINCH to prevent accidental clicks during other gestures.
         """
         is_pointing = gesture_label == "point"
         is_pinching = gesture_label == "pinch"
+        is_fisting = gesture_label == "fist"
+        is_scrolling = gesture_label == "two_fingers"
 
+        # Always calculate cursor position based on current gesture
+        # This ensures the orb is never frozen during any action
         if is_pointing:
             if not self._was_pointing:
                 self.cursor_mapper.reset()
@@ -159,18 +185,57 @@ class InteractionEngine:
                     self._dragging = True
                     osc.mouse_down()
 
+        elif is_fisting:
+            # During fist, keep orb tracking wrist but don't move OS cursor
+            wrist_pos = primary[WRIST, :2]
+            x, y = self.cursor_mapper.update(primary, xy_norm=tuple(wrist_pos))
+            self._update_overlay_position_only(x, y)
+
+        elif is_scrolling:
+            # During scroll, keep orb tracking wrist but don't move OS cursor
+            wrist_pos = primary[WRIST, :2]
+            x, y = self.cursor_mapper.update(primary, xy_norm=tuple(wrist_pos))
+            self._update_overlay_position_only(x, y)
+
+        else:
+            # NEUTRAL or unknown: keep orb at last calculated position
+            # (already in _current_cursor_x/y from previous frame)
+            pass
+
         self._was_pointing = is_pointing
 
     def _move_cursor_deadzoned(self, x: int, y: int) -> None:
-        """Only forward a cursor move when it exceeds the dead-zone threshold."""
-        lx, ly = self._last_cursor_px, self._last_cursor_py
-        if lx is None or ly is None:
-            osc.move_cursor_absolute(x, y)
-            self._last_cursor_px, self._last_cursor_py = x, y
-            return
-        if math.hypot(x - lx, y - ly) >= CURSOR_DEAD_ZONE_PX:
-            osc.move_cursor_absolute(x, y)
-            self._last_cursor_px, self._last_cursor_py = x, y
+        """Move OS cursor to exact position.
+        The orb position and OS cursor position MUST match exactly,
+        with no dead-zone filtering, so they appear as one unified pointer.
+        """
+        # Apply calibration offset
+        x_cal = x + CURSOR_OFFSET_X
+        y_cal = y + CURSOR_OFFSET_Y
+        
+        # Always update BOTH overlay and OS cursor to the same position (no filtering)
+        self._current_cursor_x = x_cal
+        self._current_cursor_y = y_cal
+        
+        # Move OS cursor directly to the calculated position (NO dead-zone)
+        # This ensures the system cursor and orb are always at the same coordinates
+        osc.move_cursor_absolute(x_cal, y_cal)
+
+    def _update_overlay_position_only(self, x: int, y: int) -> None:
+        """Update overlay and OS cursor position during FIST/SCROLL.
+        The cursor should always follow the hand, even during these gestures,
+        so the orb and system cursor remain aligned.
+        """
+        # Apply calibration offset
+        x_cal = x + CURSOR_OFFSET_X
+        y_cal = y + CURSOR_OFFSET_Y
+        
+        # Update BOTH overlay and OS cursor position
+        self._current_cursor_x = x_cal
+        self._current_cursor_y = y_cal
+        
+        # Move OS cursor to keep it aligned with orb
+        osc.move_cursor_absolute(x_cal, y_cal)
 
     # ── pinch → click / drag ─────────────────────────────────────────────────
 

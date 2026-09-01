@@ -75,8 +75,8 @@ class CursorMapper:
         screen_w: int,
         screen_h: int,
         active_zone: tuple[float, float, float, float] = (0.10, 0.90, 0.05, 0.95),
-        min_cutoff: float = 0.5,
-        beta: float = 1.5,
+        min_cutoff: float = 0.3,  # Reduced from 0.5 for more aggressive filtering
+        beta: float = 2.0,  # Increased from 1.5 for faster response to intended movement
     ):
         self.screen_w = screen_w
         self.screen_h = screen_h
@@ -195,38 +195,53 @@ _SCROLL_WRIST = 0  # wrist landmark index — most stable point during scroll
 
 class ScrollPositionTracker:
     """
-    Position-based scroll: wrist Y position relative to the vertical center of
-    the camera frame determines both DIRECTION and SPEED.
+    Position-based scroll: wrist Y position relative to a *calibrated* neutral
+    point determines both DIRECTION and SPEED.
+
+    The neutral point is set automatically to wherever your hand is the moment
+    you enter the two-finger gesture.  This means up/down scroll are always
+    symmetric around your natural hand height — no more needing to raise your
+    hand very high just to scroll up.
 
     You do not need to move your hand to keep scrolling — just hold it
-    above or below center.  The further from center, the faster the scroll.
+    above or below the neutral point.  The further from neutral, the faster
+    the scroll.
 
     Layout (camera Y: 0 = top, 1 = bottom)
     ───────────────────────────────────────
-      Hand above center  (y < 0.5)  →  scroll UP   (positive notches)
-      Hand at center     (|offset| < dead_zone)  →  no scroll (dead zone)
-      Hand below center  (y > 0.5)  →  scroll DOWN (negative notches)
+      Hand above neutral  →  scroll UP   (positive notches)
+      Hand within dead_zone of neutral  →  no scroll
+      Hand below neutral  →  scroll DOWN (negative notches)
 
     Speed curve
     ───────────
       At the dead-zone boundary  →  0 notches / sec
-      At the frame edge (y=0 or y=1)  →  max_speed notches / sec
+      At max_range from neutral  →  max_speed notches / sec
       Curve is linear between the two.  Raise max_speed to scroll faster.
 
     Tuning
     ──────
-      dead_zone   Camera fraction around centre with no scroll.  Default 0.12
-                  (hand must be >12% above or below centre to start scrolling).
+      dead_zone   Normalised units around neutral with no scroll.  Default 0.10.
+      max_range   Distance from neutral that gives full speed.  Default 0.35.
       max_speed   Notches/sec at maximum displacement.  Default 14.
     """
 
-    def __init__(self, dead_zone: float = 0.12, max_speed: float = 14.0):
+    def __init__(
+        self,
+        dead_zone: float = 0.10,
+        max_range: float = 0.35,
+        max_speed: float = 14.0,
+    ):
         self.dead_zone = dead_zone
+        self.max_range = max_range
         self.max_speed = max_speed
         self._prev_t: float = 0.0
+        self._center_y: float | None = None  # calibrated on first update after reset
 
     def reset(self):
+        """Call when the scroll gesture is first activated."""
         self._prev_t = 0.0
+        self._center_y = None  # will be set from the first real landmark
 
     def update(self, landmarks_xyz: np.ndarray) -> float:
         """
@@ -238,15 +253,24 @@ class ScrollPositionTracker:
         dt = max(now - self._prev_t, 1e-6) if self._prev_t > 0.0 else 1.0 / 30.0
         self._prev_t = now
 
-        y = float(landmarks_xyz[_SCROLL_WRIST][1])  # normalized [0..1]
-        offset = y - 0.5  # signed: + = below centre
+        y = float(landmarks_xyz[_SCROLL_WRIST][1])  # normalised [0..1]
+
+        # First frame after activation: lock the neutral point to the hand's
+        # current height so up/down are perfectly symmetric from here.
+        if self._center_y is None:
+            self._center_y = y
+            return 0.0
+
+        offset = y - self._center_y  # signed: + = below neutral = scroll down
 
         if abs(offset) < self.dead_zone:
             return 0.0
 
-        # Strip dead zone then normalise to [0..1]
+        # Strip dead zone then normalise to [0..1] over max_range
         sign = 1.0 if offset > 0.0 else -1.0
-        active = (abs(offset) - self.dead_zone) / max(0.5 - self.dead_zone, 1e-6)
+        active = (abs(offset) - self.dead_zone) / max(
+            self.max_range - self.dead_zone, 1e-6
+        )
         active = min(1.0, active)
 
         # notches this frame = speed × time

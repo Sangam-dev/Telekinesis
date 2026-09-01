@@ -11,7 +11,10 @@ import control.os_control as osc
 from features.extractor import extract_feature
 from interaction.engine import InteractionEngine
 from ml.model import GESTURE_CLASSES, load_model
+from ui.overlay import NeonCursorOverlay, VideoPreview
 from vision.hand_tracker import HandTracker
+
+from PyQt5.QtWidgets import QApplication
 
 # ── Show debug window every N inference frames (1 = always, 3 = ~10fps display)
 DISPLAY_EVERY_N = 2
@@ -118,6 +121,11 @@ def _open_camera() -> cv2.VideoCapture:
 
 
 def main():
+    # ── Qt must initialise FIRST, before mediapipe/opencv spin up their own
+    #    EGL/OpenGL contexts. Constructing it later crashes QApplication with
+    #    "Could not load the Qt platform plugin xcb".
+    app = QApplication.instance() or QApplication([])
+
     screen_w, screen_h = get_screen_resolution()
     print(f"Detected screen resolution: {screen_w}x{screen_h}")
 
@@ -131,96 +139,110 @@ def main():
     engine = InteractionEngine(screen_w, screen_h)
     smoother = _ProbSmoother(num_classes=len(GESTURE_CLASSES))
 
+    # ── Neon reticle (replaces the system cursor while active) ───────────────
+    overlay = NeonCursorOverlay(screen_w, screen_h)
+    overlay_started = False
+    running = True
+
+    # ── Debug: set to True to print coordinates ──────────────────────────────
+    DEBUG_COORDS = False
+
+    # ── Camera preview window (replaces cv2.imshow, no Qt conflict) ──────────
+    preview = VideoPreview()
+    preview.show()
+
+    def _on_quit():
+        nonlocal running
+        running = False
+
+    def _on_escape():
+        engine.emergency_stop()
+        print("EMERGENCY STOP. Press Ctrl+C to exit.")
+
+    overlay.set_escape_callback(_on_escape)
+    overlay.set_quit_callback(_on_quit)
+
     # Wait for the camera thread to deliver its first frame
     print("Waiting for camera…")
     while camera.frame_count == 0:
         time.sleep(0.01)
-    print("Running. ESC in the video window = emergency stop.")
+    print("Running. Ctrl+C quits. ESC = emergency stop.")
 
     loop_iter = 0
     prev_time = time.monotonic()
 
-    while True:
-        ok, frame = camera.read()
-        if not ok or frame is None:
-            time.sleep(0.005)
-            continue
+    try:
+        while running:
+            ok, frame = camera.read()
+            if not ok or frame is None:
+                time.sleep(0.005)
+                continue
 
-        frame = cv2.flip(frame, 1)
+            frame = cv2.flip(frame, 1)
 
-        results, hands_lms = tracker.process(frame)
+            results, hands_lms = tracker.process(frame)
 
-        gesture_label = "neutral"
-        confidence = 0.0
+            gesture_label = "neutral"
+            confidence = 0.0
 
-        if hands_lms:
-            feats = extract_feature(hands_lms[0])
-            x_in = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
-            with torch.no_grad():
-                logits = model(x_in)
-                raw_probs = F.softmax(logits, dim=1).squeeze(0).numpy()
+            if hands_lms:
+                feats = extract_feature(hands_lms[0])
+                x_in = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
+                with torch.no_grad():
+                    logits = model(x_in)
+                    raw_probs = F.softmax(logits, dim=1).squeeze(0).numpy()
 
-            # Asymmetric EMA: fast to recognise new gestures, slow to drop them.
-            # Prevents 1-3 frame classifier hiccups from interrupting drag/scroll/fist.
-            smooth_probs = smoother.update(raw_probs)
+                # Asymmetric EMA: fast to recognise new gestures, slow to drop them.
+                # Prevents 1-3 frame classifier hiccups from interrupting drag/scroll/fist.
+                smooth_probs = smoother.update(raw_probs)
 
-            pred_idx = int(smooth_probs.argmax())
-            gesture_label = GESTURE_CLASSES[pred_idx]
-            confidence = float(smooth_probs[pred_idx])
-            engine.process_frame(gesture_label, confidence, hands_lms)
+                pred_idx = int(smooth_probs.argmax())
+                gesture_label = GESTURE_CLASSES[pred_idx]
+                confidence = float(smooth_probs[pred_idx])
+                engine.process_frame(gesture_label, confidence, hands_lms)
 
-        # ── Display (every N frames to keep render from bottlenecking control) ──
-        loop_iter += 1
-        if loop_iter % DISPLAY_EVERY_N == 0:
-            now = time.monotonic()
-            fps = 1.0 / max(now - prev_time, 1e-6) * DISPLAY_EVERY_N
-            prev_time = now
+            # ── Neon reticle: replaces the cursor while control is enabled ───
+            if engine.control_enabled:
+                if not overlay_started:
+                    overlay.start()
+                    overlay_started = True
+                cx, cy = engine.get_cursor_position()
+                if DEBUG_COORDS and loop_iter % 10 == 0:
+                    print(f"[DEBUG] Overlay: ({cx}, {cy})")
+                overlay.update_state(
+                    cx,
+                    cy,
+                    gesture_label,
+                    confidence,
+                    hand_detected=bool(hands_lms),
+                )
+            else:
+                if overlay_started:
+                    overlay.stop()
+                    overlay_started = False
 
-            frame = tracker.draw(frame, results)
+            # ── Camera preview + HUD status (every N frames, no cv2.imshow) ──
+            loop_iter += 1
+            if loop_iter % DISPLAY_EVERY_N == 0:
+                now = time.monotonic()
+                fps = 1.0 / max(now - prev_time, 1e-6) * DISPLAY_EVERY_N
+                prev_time = now
+                overlay.update_status(fps, control_enabled=engine.control_enabled)
+                # Draw skeleton overlay onto the frame and show it in preview
+                disp = tracker.draw(frame.copy(), results)
+                preview.show_frame(disp)
 
-            status_color = (0, 255, 0) if engine.control_enabled else (0, 0, 255)
-            status_text = (
-                "CONTROL ACTIVE" if engine.control_enabled else "EMERGENCY STOP"
-            )
-            cv2.putText(
-                frame,
-                status_text,
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                status_color,
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"{gesture_label} ({confidence:.2f})",
-                (10, 58),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 0),
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"FPS: {fps:.0f}",
-                (10, 86),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (180, 180, 180),
-                2,
-            )
-
-            cv2.imshow("AI Telekinesis  (ESC = emergency stop)", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC
+            app.processEvents()
+    except KeyboardInterrupt:
+        print("\nQuit requested.")
+    finally:
+        if engine.control_enabled:
             engine.emergency_stop()
-            print("EMERGENCY STOP. Close the window to exit.")
-        elif key == ord("q"):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
+        if overlay_started:
+            overlay.stop()
+        preview.close()
+        cap.release()
+        print("Cleaned up.")
 
 
 if __name__ == "__main__":
