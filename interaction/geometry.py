@@ -195,38 +195,51 @@ _SCROLL_WRIST = 0  # wrist landmark index — most stable point during scroll
 
 class ScrollPositionTracker:
     """
-    Position-based scroll: wrist Y position relative to the vertical center of
-    the camera frame determines both DIRECTION and SPEED.
+    Position-based scroll: wrist Y position relative to a calibrated neutral
+    point determines both DIRECTION and SPEED.
+
+    The neutral point is captured when the two-finger gesture begins, so the
+    user can start scrolling from a comfortable hand position.
 
     You do not need to move your hand to keep scrolling — just hold it
-    above or below center.  The further from center, the faster the scroll.
+    above or below neutral.  The further from neutral, the faster the scroll.
 
     Layout (camera Y: 0 = top, 1 = bottom)
     ───────────────────────────────────────
-      Hand above center  (y < 0.5)  →  scroll UP   (positive notches)
-      Hand at center     (|offset| < dead_zone)  →  no scroll (dead zone)
-      Hand below center  (y > 0.5)  →  scroll DOWN (negative notches)
+            Hand above neutral  →  scroll UP   (positive notches)
+            Hand near neutral    →  no scroll (dead zone)
+            Hand below neutral   →  scroll DOWN (negative notches)
 
     Speed curve
     ───────────
       At the dead-zone boundary  →  0 notches / sec
-      At the frame edge (y=0 or y=1)  →  max_speed notches / sec
+        At max_range from neutral  →  max_speed notches / sec
       Curve is linear between the two.  Raise max_speed to scroll faster.
 
     Tuning
     ──────
-      dead_zone   Camera fraction around centre with no scroll.  Default 0.12
-                  (hand must be >12% above or below centre to start scrolling).
+          dead_zone   Camera fraction around neutral with no scroll.  Default 0.10
+              (hand must move >10% from neutral to start scrolling).
+          max_range   Distance from neutral that gives full speed.  Default 0.35.
       max_speed   Notches/sec at maximum displacement.  Default 14.
     """
 
-    def __init__(self, dead_zone: float = 0.12, max_speed: float = 14.0):
+    def __init__(
+        self,
+        dead_zone: float = 0.10,
+        max_range: float = 0.35,
+        max_speed: float = 14.0,
+    ):
         self.dead_zone = dead_zone
+        self.max_range = max_range
         self.max_speed = max_speed
         self._prev_t: float = 0.0
+        self._center_y: float | None = None
 
     def reset(self):
+        """Reset timing and recapture the neutral hand position."""
         self._prev_t = 0.0
+        self._center_y = None
 
     def update(self, landmarks_xyz: np.ndarray) -> float:
         """
@@ -239,14 +252,20 @@ class ScrollPositionTracker:
         self._prev_t = now
 
         y = float(landmarks_xyz[_SCROLL_WRIST][1])  # normalized [0..1]
-        offset = y - 0.5  # signed: + = below centre
+        if self._center_y is None:
+            self._center_y = y
+            return 0.0
+
+        offset = y - self._center_y  # signed: + = below neutral
 
         if abs(offset) < self.dead_zone:
             return 0.0
 
-        # Strip dead zone then normalise to [0..1]
+        # Strip dead zone then normalise to [0..1] over max_range
         sign = 1.0 if offset > 0.0 else -1.0
-        active = (abs(offset) - self.dead_zone) / max(0.5 - self.dead_zone, 1e-6)
+        active = (abs(offset) - self.dead_zone) / max(
+            self.max_range - self.dead_zone, 1e-6
+        )
         active = min(1.0, active)
 
         # notches this frame = speed × time

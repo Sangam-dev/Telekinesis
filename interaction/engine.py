@@ -4,6 +4,7 @@ import time
 import numpy as np
 
 import control.os_control as osc
+from config.cursor_calibration import ACTIVE_ZONE
 from interaction.geometry import (
     CursorMapper,
     OneEuroFilter,
@@ -34,7 +35,9 @@ class InteractionEngine:
         self.screen_w = screen_w
         self.screen_h = screen_h
 
-        self.cursor_mapper = CursorMapper(screen_w, screen_h)
+        self.cursor_mapper = CursorMapper(
+            screen_w, screen_h, active_zone=ACTIVE_ZONE
+        )
         self.zoom_tracker = ZoomTracker()
         self.swipe_tracker = SwipeTracker()
         self.scroll_tracker = ScrollPositionTracker()

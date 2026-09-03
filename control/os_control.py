@@ -4,7 +4,7 @@ import threading
 import time
 
 # ── GNOME hot-corner guard ────────────────────────────────────────────────────
-HOT_CORNER_MARGIN = 20  # pixels — cursor is clamped this far from corners
+HOT_CORNER_MARGIN = 0  # pixels — allow the cursor to reach every corner
 
 # ── evdev backend ─────────────────────────────────────────────────────────────
 try:
