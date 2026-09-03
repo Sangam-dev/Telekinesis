@@ -15,6 +15,9 @@ from vision.hand_tracker import HandTracker
 
 # ── Show debug window every N inference frames (1 = always, 3 = ~10fps display)
 DISPLAY_EVERY_N = 2
+VIDEO_WINDOW_NAME = "AI Telekinesis  (ESC = emergency stop)"
+VIDEO_COMPACT_SIZE = (360, 270)
+VIDEO_EXPANDED_SIZE = (640, 480)
 
 
 # ── Probability smoother ──────────────────────────────────────────────────────
@@ -114,6 +117,100 @@ def _open_camera() -> cv2.VideoCapture:
     return cap
 
 
+def _draw_preview_ui(
+    frame: np.ndarray,
+    gesture_label: str,
+    confidence: float,
+    fps: float,
+    hand_count: int,
+    control_enabled: bool,
+) -> np.ndarray:
+    """Draw a compact status HUD over the camera frame."""
+    height, width = frame.shape[:2]
+    panel = frame.copy()
+    cv2.rectangle(panel, (0, 0), (width, 104), (12, 18, 25), -1)
+    cv2.rectangle(panel, (0, height - 32), (width, height), (12, 18, 25), -1)
+    cv2.addWeighted(panel, 0.82, frame, 0.18, 0, frame)
+
+    accent = (70, 220, 255) if control_enabled else (80, 90, 255)
+    status = "ACTIVE" if control_enabled else "STOPPED"
+    cv2.circle(frame, (18, 22), 6, accent, -1, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        "TELEKINESIS",
+        (32, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (235, 242, 248),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        status,
+        (width - 94, 27),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        accent,
+        1,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        frame,
+        gesture_label.replace("_", " ").upper(),
+        (16, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.78,
+        accent,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"{confidence:.0%}  |  {hand_count} hand{'s' if hand_count != 1 else ''}",
+        (width - 185, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (215, 225, 235),
+        1,
+        cv2.LINE_AA,
+    )
+
+    bar_left, bar_right = 16, width - 16
+    bar_y = 88
+    cv2.rectangle(frame, (bar_left, bar_y), (bar_right, bar_y + 5), (45, 58, 68), -1)
+    cv2.rectangle(
+        frame,
+        (bar_left, bar_y),
+        (bar_left + int((bar_right - bar_left) * confidence), bar_y + 5),
+        accent,
+        -1,
+    )
+
+    cv2.putText(
+        frame,
+        f"{fps:.0f} FPS",
+        (14, height - 11),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (180, 195, 205),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        "C  size   H  hide   Q  quit",
+        (width - 174, height - 11),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.36,
+        (180, 195, 205),
+        1,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
@@ -136,6 +233,13 @@ def main():
     while camera.frame_count == 0:
         time.sleep(0.01)
     print("Running. ESC in the video window = emergency stop.")
+
+    # Keep the preview useful without letting it occupy the whole desktop.
+    # WINDOW_NORMAL lets the user resize it freely from the title bar/corners.
+    cv2.namedWindow(VIDEO_WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow(VIDEO_WINDOW_NAME, *VIDEO_COMPACT_SIZE)
+    video_visible = True
+    video_expanded = False
 
     loop_iter = 0
     prev_time = time.monotonic()
@@ -167,7 +271,10 @@ def main():
             pred_idx = int(smooth_probs.argmax())
             gesture_label = GESTURE_CLASSES[pred_idx]
             confidence = float(smooth_probs[pred_idx])
-            engine.process_frame(gesture_label, confidence, hands_lms)
+
+        # Feed empty-hand frames to the engine too, so its grace periods can
+        # absorb brief tracking dropouts instead of freezing the gesture state.
+        engine.process_frame(gesture_label, confidence, hands_lms)
 
         # ── Display (every N frames to keep render from bottlenecking control) ──
         loop_iter += 1
@@ -178,39 +285,17 @@ def main():
 
             frame = tracker.draw(frame, results)
 
-            status_color = (0, 255, 0) if engine.control_enabled else (0, 0, 255)
-            status_text = (
-                "CONTROL ACTIVE" if engine.control_enabled else "EMERGENCY STOP"
-            )
-            cv2.putText(
+            frame = _draw_preview_ui(
                 frame,
-                status_text,
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                status_color,
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"{gesture_label} ({confidence:.2f})",
-                (10, 58),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 0),
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"FPS: {fps:.0f}",
-                (10, 86),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (180, 180, 180),
-                2,
+                gesture_label,
+                confidence,
+                fps,
+                len(hands_lms),
+                engine.control_enabled,
             )
 
-            cv2.imshow("AI Telekinesis  (ESC = emergency stop)", frame)
+            if video_visible:
+                cv2.imshow(VIDEO_WINDOW_NAME, frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27:  # ESC
@@ -218,6 +303,17 @@ def main():
             print("EMERGENCY STOP. Close the window to exit.")
         elif key == ord("q"):
             break
+        elif key == ord("c"):
+            video_expanded = not video_expanded
+            size = VIDEO_EXPANDED_SIZE if video_expanded else VIDEO_COMPACT_SIZE
+            cv2.resizeWindow(VIDEO_WINDOW_NAME, *size)
+        elif key == ord("h"):
+            video_visible = not video_visible
+            cv2.setWindowProperty(
+                VIDEO_WINDOW_NAME,
+                cv2.WND_PROP_VISIBLE,
+                1 if video_visible else 0,
+            )
 
     cap.release()
     cv2.destroyAllWindows()

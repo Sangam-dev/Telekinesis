@@ -75,8 +75,8 @@ class CursorMapper:
         screen_w: int,
         screen_h: int,
         active_zone: tuple[float, float, float, float] = (0.10, 0.90, 0.05, 0.95),
-        min_cutoff: float = 0.5,
-        beta: float = 1.5,
+        min_cutoff: float = 0.8,
+        beta: float = 2.0,
     ):
         self.screen_w = screen_w
         self.screen_h = screen_h

@@ -17,7 +17,7 @@ from interaction.state_machine import GestureStateMachine
 # ── Tunables ──────────────────────────────────────────────────────────────────
 DRAG_THRESHOLD_PX = 18  # pixels before pinch becomes a drag
 FIST_DRAG_SCALE = 1.2  # wrist-movement amplification for window drag
-CURSOR_DEAD_ZONE_PX = 4  # ignore moves smaller than this to suppress micro-jitter
+CURSOR_DEAD_ZONE_PX = 2  # suppress tremor without making small moves feel sticky
 
 # Landmark indices
 THUMB_TIP = 4
@@ -44,13 +44,19 @@ class InteractionEngine:
 
         # exit_frames_required = grace period (frames) for classifier noise / hand loss
         self.pinch_sm = GestureStateMachine(
-            stable_frames_required=4, exit_frames_required=5, cooldown_sec=0.25
+            stable_frames_required=3,
+            exit_frames_required=10,
+            confidence_threshold=0.72,
+            cooldown_sec=0.15,
         )
         self.scroll_sm = GestureStateMachine(
             stable_frames_required=3, exit_frames_required=8, cooldown_sec=0.10
         )
         self.fist_sm = GestureStateMachine(
-            stable_frames_required=5, exit_frames_required=8, cooldown_sec=0.30
+            stable_frames_required=3,
+            exit_frames_required=12,
+            confidence_threshold=0.72,
+            cooldown_sec=0.15,
         )
 
         # Pinch / drag state
@@ -60,7 +66,7 @@ class InteractionEngine:
 
         # Fist / window-grab state  (incremental delta design)
         self._fist_window_id: int | None = None
-        self._fist_win_pos: list[int] = [0, 0]  # current window x,y
+        self._fist_win_pos: list[float] = [0.0, 0.0]  # current window x,y
         self._fist_prev_wrist: np.ndarray | None = None  # wrist position last frame
 
         # Smoothing filters for fist-drag wrist position (normalised coords)
@@ -141,7 +147,11 @@ class InteractionEngine:
         CURSOR_DEAD_ZONE_PX pixels.
         """
         is_pointing = gesture_label == "point"
-        is_pinching = gesture_label == "pinch"
+        # Once a pinch is active, tolerate short classifier dropouts and keep
+        # moving from the current landmarks until the state machine releases it.
+        is_pinching = gesture_label == "pinch" or (
+            self._pinch_live and self.pinch_sm.is_held()
+        )
 
         if is_pointing:
             if not self._was_pointing:
@@ -235,6 +245,9 @@ class InteractionEngine:
         that small hand tremor does not jitter the dragged window.
         """
         self.fist_sm.update(gesture_label == "fist", confidence)
+        fist_active = gesture_label == "fist" or (
+            self._fist_window_id is not None and self.fist_sm.is_held()
+        )
 
         if self.fist_sm.just_activated():
             # Reset wrist smoothing so the very first filtered sample == raw sample
@@ -245,7 +258,7 @@ class InteractionEngine:
             wid, wx, wy = osc.get_window_under_cursor()
             if wid is not None:
                 self._fist_window_id = wid
-                self._fist_win_pos = [wx, wy]
+                self._fist_win_pos = [float(wx), float(wy)]
                 raw = primary[WRIST, :2]
                 now = time.monotonic()
                 sx = self._fist_wrist_fx(float(raw[0]), t=now)
@@ -259,7 +272,7 @@ class InteractionEngine:
                     "  [fist] no moveable window under cursor (pure-Wayland surface?)"
                 )
 
-        if self.fist_sm.is_held() and self._fist_window_id is not None:
+        if fist_active and self.fist_sm.is_held() and self._fist_window_id is not None:
             raw = primary[WRIST, :2]
             now = time.monotonic()
             sx = self._fist_wrist_fx(float(raw[0]), t=now)
@@ -270,16 +283,18 @@ class InteractionEngine:
                 # Per-frame delta on smoothed wrist → accumulate into window position
                 dx_norm = float(wrist_now[0] - self._fist_prev_wrist[0])
                 dy_norm = float(wrist_now[1] - self._fist_prev_wrist[1])
-                self._fist_win_pos[0] += int(
+                self._fist_win_pos[0] += (
                     dx_norm * self._win_scale_x * FIST_DRAG_SCALE
                 )
-                self._fist_win_pos[1] += int(
+                self._fist_win_pos[1] += (
                     dy_norm * self._win_scale_y * FIST_DRAG_SCALE
                 )
                 # Keep window title bar on-screen (GNOME refuses to place it above y=0)
                 self._fist_win_pos[1] = max(0, self._fist_win_pos[1])
                 osc.move_window(
-                    self._fist_window_id, self._fist_win_pos[0], self._fist_win_pos[1]
+                    self._fist_window_id,
+                    int(round(self._fist_win_pos[0])),
+                    int(round(self._fist_win_pos[1])),
                 )
 
             # Always update prev_wrist — during grace period this stays frozen,
